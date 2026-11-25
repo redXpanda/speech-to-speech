@@ -22,6 +22,8 @@ from typing import Any, Iterator, Optional, cast
 import numpy as np
 import torch
 from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
+from speech_to_speech.pipeline.audio_rates import OUTPUT_SAMPLE_RATE
+from openai.types.realtime.realtime_response_create_params import RealtimeResponseCreateParams
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.api.openai_realtime.utils import StreamingPcm16Resampler
@@ -58,7 +60,7 @@ VALID_MLX_QUANTIZATION_SUFFIXES = ("bf16", "4bit", "6bit", "8bit")
 VALID_GGML_QUANTIZATIONS = ("BF16", "Q8_0", "Q4_K_M", "F32")
 VALID_FASTER_BACKENDS = ("ggml", "torch")
 MLX_STREAMING_TOKENS_PER_SECOND = 12.5
-PIPELINE_SR = 16000
+PIPELINE_SR = OUTPUT_SAMPLE_RATE
 ESTIMATED_QWEN3_WORDS_PER_SECOND = 2.6
 ESTIMATED_QWEN3_CHARS_PER_SECOND = 14.0
 ESTIMATED_QWEN3_CJK_CHARS_PER_SECOND = 5.5

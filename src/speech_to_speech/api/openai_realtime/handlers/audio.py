@@ -25,6 +25,7 @@ from speech_to_speech.api.openai_realtime.input_state import (
     PendingInputTerminal,
 )
 from speech_to_speech.api.openai_realtime.utils import StreamingPcm16Resampler
+from speech_to_speech.pipeline.audio_rates import INPUT_SAMPLE_RATE, OUTPUT_SAMPLE_RATE
 from speech_to_speech.pipeline.events import SpeechStartedEvent, SpeechStoppedEvent
 from speech_to_speech.pipeline.speculative_turns import TurnGateAction
 
@@ -33,7 +34,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_SAMPLE_RATE = 16000
+PIPELINE_SAMPLE_RATE = INPUT_SAMPLE_RATE
+PIPELINE_OUTPUT_RATE = OUTPUT_SAMPLE_RATE
 CHUNK_SAMPLES = 512
 BYTES_PER_SAMPLE = 2
 CHUNK_SIZE_BYTES = CHUNK_SAMPLES * BYTES_PER_SAMPLE
@@ -544,13 +546,13 @@ class AudioHandler(RealtimeBaseHandler):
         if client_out_rate is None:
             audio_cfg = st.runtime_config.session.audio
             if audio_cfg is not None and audio_cfg.output is not None:
-                client_out_rate = getattr(audio_cfg.output.format, "rate", None) or PIPELINE_SAMPLE_RATE
+                client_out_rate = getattr(audio_cfg.output.format, "rate", None) or PIPELINE_OUTPUT_RATE
             else:
-                client_out_rate = PIPELINE_SAMPLE_RATE
-        if client_out_rate != PIPELINE_SAMPLE_RATE:
+                client_out_rate = PIPELINE_OUTPUT_RATE
+        if client_out_rate != PIPELINE_OUTPUT_RATE:
             resampler_key = (resp_id, assistant_item_id, client_out_rate)
             if st.output_audio_resampler_key != resampler_key:
-                st.output_audio_resampler = StreamingPcm16Resampler(PIPELINE_SAMPLE_RATE, client_out_rate)
+                st.output_audio_resampler = StreamingPcm16Resampler(PIPELINE_OUTPUT_RATE, client_out_rate)
                 st.output_audio_resampler_key = resampler_key
             audio = st.output_audio_resampler.push(audio)
         else:

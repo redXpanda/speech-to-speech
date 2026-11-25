@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from fastapi import WebSocket, WebSocketDisconnect
 from starlette.websockets import WebSocketState
 
-from speech_to_speech.api.openai_realtime.handlers.audio import PIPELINE_SAMPLE_RATE
+from speech_to_speech.api.openai_realtime.handlers.audio import PIPELINE_OUTPUT_RATE
 
 if TYPE_CHECKING:
     from speech_to_speech.api.openai_realtime.service import RealtimeService, ServerEvent
@@ -118,7 +118,7 @@ class WebSocketTransport(SessionTransport):
         events = service.encode_audio_chunk(session_id, pcm, response_key)
         # History counts this audio as delivered from here on, so a discard
         # during the send must count it as unplayed.
-        seconds = len(pcm) / 2 / PIPELINE_SAMPLE_RATE if events else 0.0
+        seconds = len(pcm) / 2 / PIPELINE_OUTPUT_RATE if events else 0.0
         discards = self._discards
         self._sending_seconds += seconds
         try:

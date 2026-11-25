@@ -42,7 +42,7 @@ from openai.types.realtime.realtime_response_usage_output_token_details import (
 from openai.types.realtime.response_content_part_added_event import Part as AddedContentPart
 from openai.types.realtime.response_content_part_done_event import Part as DoneContentPart
 
-from speech_to_speech.api.openai_realtime.handlers.audio import PIPELINE_SAMPLE_RATE
+from speech_to_speech.api.openai_realtime.handlers.audio import PIPELINE_OUTPUT_RATE
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.api.openai_realtime.reasoning import SpeechToSpeechReasoningDeltaEvent
 from speech_to_speech.api.openai_realtime.runtime_config import validate_reasoning
@@ -1055,8 +1055,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 if segment is not unfinished and segment[0] and segment[1] and segment[1] == segment[2]:
                     chars += len(segment[0])
                     samples += segment[2]
-        if samples < PIPELINE_SAMPLE_RATE:
-            return PIPELINE_SAMPLE_RATE / _FALLBACK_CHARS_PER_SECOND
+        if samples < PIPELINE_OUTPUT_RATE:
+            return PIPELINE_OUTPUT_RATE / _FALLBACK_CHARS_PER_SECOND
         return samples / chars
 
     def _heard_output(
@@ -1131,7 +1131,7 @@ class ResponseHandler(RealtimeBaseHandler):
             return
         delivered = sum(segment[1] for segment in segments)
         played_samples = min(max(0, played_samples), delivered)
-        if delivered - played_samples < PIPELINE_SAMPLE_RATE // 1000:
+        if delivered - played_samples < PIPELINE_OUTPUT_RATE // 1000:
             # Positions arrive in whole milliseconds, so the end of audio that
             # is not a whole millisecond long is reported slightly short.
             played_samples = delivered
@@ -1146,12 +1146,12 @@ class ResponseHandler(RealtimeBaseHandler):
 
     def handle_conversation_item_truncate(self, conn_id: str, event: ConversationItemTruncateEvent) -> None:
         """Remove the unplayed part of an assistant reply from model history."""
-        played_samples = event.audio_end_ms * PIPELINE_SAMPLE_RATE // 1000
+        played_samples = event.audio_end_ms * PIPELINE_OUTPUT_RATE // 1000
         self._truncate_audio_item(conn_id, event.item_id, played_samples, "client playback position")
 
     def truncate_unplayed_audio(self, conn_id: str, unplayed_ms: float) -> None:
         """Remove audio the client did not play from the newest items."""
-        remaining = round(unplayed_ms * PIPELINE_SAMPLE_RATE / 1000)
+        remaining = round(unplayed_ms * PIPELINE_OUTPUT_RATE / 1000)
         st = self._state(conn_id)
         for item_id, segments in reversed(list(st.assistant_audio_segments.items())):
             if remaining <= 0:

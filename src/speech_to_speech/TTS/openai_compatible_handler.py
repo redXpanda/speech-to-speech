@@ -15,6 +15,7 @@ import httpx2
 import numpy as np
 from scipy.signal import firwin, upfirdn
 
+from speech_to_speech.pipeline.audio_rates import OUTPUT_SAMPLE_RATE
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.LLM.utils import WHISPER_LANGUAGE_TO_LLM_LANGUAGE
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -29,7 +30,8 @@ from speech_to_speech.utils.request_tracing import HttpRequestContext, HttpReque
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_SAMPLE_RATE = 16000
+PIPELINE_SAMPLE_RATE = OUTPUT_SAMPLE_RATE
+
 QWEN3_TTS_LANGUAGE_CODES = frozenset({"zh", "en", "ja", "ko", "de", "fr", "ru", "pt", "es", "it"})
 
 
