@@ -23,6 +23,7 @@ class SpeechToSpeechInputAudioTranscriptionSnapshotEvent(BaseModel):
     item_id: str
     content_index: int = 0
     transcript: str
+    asr_complete: bool = False
 
 
 class InputItemState(BaseModel):
