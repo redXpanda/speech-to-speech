@@ -966,7 +966,14 @@ class RealtimeService:
             event.turn_revision,
             terminal=completed_events[0],
         )
-        return self.audio.resolve_input_terminals(conn_id)
+        terminals = self.audio.resolve_input_terminals(conn_id)
+        if cfg.input_audio_transcription_snapshots_enabled and not terminals:
+            final = completed_events[0]
+            terminals.append(SpeechToSpeechInputAudioTranscriptionSnapshotEvent(
+                event_id=self._next_event_id(), item_id=final.item_id,
+                transcript=final.transcript, asr_complete=True,
+            ))
+        return terminals
 
     def _on_transcription_failed(self, conn_id: str, event: TranscriptionFailedEvent) -> list[ServerEvent]:
         """Surface a final STT failure without creating conversation or LLM work."""

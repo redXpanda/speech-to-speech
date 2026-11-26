@@ -73,6 +73,32 @@ from .realtime_contract import (
 # ---------------------------------------------------------------------------
 
 
+def test_opted_in_client_receives_final_asr_before_assistant_output(setup):
+    app, service, _, _, text_output_queue, *_ = setup
+    tracker = SpeculativeTurnTracker()
+    service.speculative_turns = tracker
+    with TestClient(app) as client:
+        with client.websocket_connect("/v1/realtime") as ws:
+            ws.receive_json()
+            ws.send_json({"type": "session.update", "session": {
+                "type": "realtime",
+                "extensions": ["speech_to_speech.input_audio_transcription.snapshot"],
+            }})
+            assert ws.receive_json()["type"] == "session.updated"
+            turn_id, revision = tracker.start_turn()
+            turn = {"turn_id": turn_id, "turn_revision": revision}
+            text_output_queue.put(SpeechStartedEvent(**turn))
+            started = ws.receive_json()
+            assert started["type"] == "input_audio_buffer.speech_started"
+            tracker.segment_finalized(100)
+            text_output_queue.put(SpeechStoppedEvent(duration_s=0.1, **turn))
+            text_output_queue.put(TranscriptionCompletedEvent(transcript="Hello", **turn))
+            preview = ws.receive_json()
+            assert preview["type"] == "speech_to_speech.input_audio_transcription.snapshot"
+            assert preview["asr_complete"] and preview["transcript"] == "Hello"
+            assert preview["item_id"] == started["item_id"]
+
+
 @pytest.mark.parametrize("direct_audio", [False, True])
 def test_manual_response_mode_delivers_one_reply_per_explicit_request(setup, direct_audio):
     app, service, _, output_queue, text_output_queue, *_ = setup
