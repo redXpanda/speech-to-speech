@@ -14,6 +14,8 @@
 
 </div>
 
+For this workspace’s Windows deployment, smoke tests, and ASR comparison, see the README in the sibling `aivoice-stack` repository.
+
 A low-latency voice agent built from open models that **runs entirely on your computer**. One command starts a conversation: no API key, no cloud service.
 
 The default pipeline is **Silero VAD → Parakeet TDT → Qwen3.5-4B → Qwen3-TTS**, and every stage is swappable. The server speaks the **OpenAI Realtime protocol** over WebSocket and WebRTC, so apps built for OpenAI's Realtime API can point at your own machine instead.
