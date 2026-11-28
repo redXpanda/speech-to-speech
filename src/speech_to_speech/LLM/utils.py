@@ -104,7 +104,7 @@ def _has_unclosed_markdown_fence(text: str) -> bool:
 # and Devanagari replies would otherwise stay one sentence until the stream
 # ends. Split again after those terminators, keeping closing quotes and brackets
 # with the sentence they close.
-_NON_LATIN_SENTENCE_END_PATTERN = re.compile(r"[。！？｡؟।॥]+[」』）”’\"')]*")
+_NON_LATIN_SENTENCE_END_PATTERN = re.compile(r"[。！？…｡؟।॥]+[」』）”’\"')]*")
 
 
 def _split_after_non_latin_terminators(sentence: str) -> list[str]:
