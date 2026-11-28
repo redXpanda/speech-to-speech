@@ -871,12 +871,19 @@ class ResponseHandler(RealtimeBaseHandler):
         """
         st = self._state(conn_id)
         if st.external_context is not None:
-            if event.response is not None and event.response.model_dump(exclude_unset=True):
-                return self.make_error("Response overrides are unsupported with external context.", "invalid_request_error")
+            overrides = event.response.model_dump(exclude_unset=True) if event.response is not None else {}
+            source = None
+            if overrides:
+                metadata = overrides.get("metadata") or {}
+                source = metadata.get("aivoice_regenerate_response_id")
+                if (set(overrides) != {"metadata"} or set(metadata) != {"aivoice_regenerate_response_id"}
+                        or not isinstance(source, str) or not 0 < len(source) <= 128
+                        or not source.isascii() or not source.replace("_", "").isalnum()):
+                    return self.make_error("Response overrides are unsupported with external context.", "invalid_request_error")
             if st.in_response or st.response_pending:
                 return self.make_error("Another response is active.", "conversation_already_has_active_response")
             request = GenerateResponseRequest(runtime_config=st.runtime_config)
-            st.external_context.start(self._service, request)
+            st.external_context.start(self._service, request, source)
             self._ensure_response(conn_id, request.response_key)
             st.response_created_pending_key = request.response_key
             return ResponseCreatedEvent(type="response.created", event_id=self._next_event_id(),
@@ -1210,6 +1217,8 @@ class ResponseHandler(RealtimeBaseHandler):
                 or reply.status is None or reply.receipt_sent):
             return
         text, played_ms = self._external_played_prefix(conn_id, item_id, played_ms, reply.status)
+        if reply.regenerating and reply.status != "completed":
+            text = ""
         reply.receipt_sent = True
         reply.receipt_task = context.spawn(context.receipt(reply, text, played_ms))
 

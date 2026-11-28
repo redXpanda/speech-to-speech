@@ -31,6 +31,7 @@ class Reply:
     receipt_sent: bool = False
     receipt_task: asyncio.Task | None = None
     receipt_done: asyncio.Event = field(default_factory=asyncio.Event)
+    regenerating: bool = False
 
 
 class RealtimeContext:
@@ -64,17 +65,19 @@ class RealtimeContext:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    def start(self, service: RealtimeService, request: GenerateResponseRequest) -> Reply:
+    def start(self, service: RealtimeService, request: GenerateResponseRequest,
+              regenerate_response_id: str | None = None) -> Reply:
         previous = [reply.receipt_done for reply in self.replies.values()
                     if reply.item_id is not None and not reply.receipt_done.is_set()]
-        reply = self.active = self.replies[request.response_key] = Reply()
+        reply = self.active = self.replies[request.response_key] = Reply(regenerating=regenerate_response_id is not None)
         while len(self.replies) > 32:
             self.replies.pop(next(iter(self.replies)))
         mutation = self.mutation if self.mutation is not None and not self.mutation.done() else None
-        reply.generation = self.spawn(self._generate(service, request, reply, previous, self.input, mutation))
+        reply.generation = self.spawn(self._generate(service, request, reply, previous, self.input, mutation,
+                                                     regenerate_response_id))
         return reply
 
-    async def _generate(self, service, request, reply, previous, user_input, mutation) -> None:
+    async def _generate(self, service, request, reply, previous, user_input, mutation, regenerate_response_id) -> None:
         queue = service.context_output_queue
         scope = service.context_cancel_scope
         tags = dict(response_key=request.response_key, cancel_generation=scope.generation,
@@ -100,25 +103,39 @@ class RealtimeContext:
                 await asyncio.sleep(0.02)
             if status != "cancelled":
                 item_id, transcript, language = user_input or (uuid4().hex, "", None)
-                if self.confirmed_turn_id == item_id:
-                    item_id, transcript = uuid4().hex, ""
-                self.revision = max(request.turn_revision or 0, self.revision + 1 if item_id == self.last_turn_id else 0)
-                self.last_turn_id = item_id
-                turn_id = f"{request.runtime_config.trace_session_id}:{item_id}"
-                reply.turn = ContextTurn(turn_id, self.revision, reply.response_id)
-                if item_id in self.items:
-                    self.item_replies[item_id] = reply
+                if regenerate_response_id is None:
+                    if self.confirmed_turn_id == item_id:
+                        item_id, transcript = uuid4().hex, ""
+                    self.revision = max(request.turn_revision or 0, self.revision + 1 if item_id == self.last_turn_id else 0)
+                    self.last_turn_id = item_id
+                    turn_id = f"{request.runtime_config.trace_session_id}:{item_id}"
+                    turn = reply.turn = ContextTurn(turn_id, self.revision, reply.response_id)
+                    if item_id in self.items:
+                        self.item_replies[item_id] = reply
+                    options = {}
+                else:
+                    # The gateway resolves the original turn and assigns its next revision.
+                    turn = ContextTurn(reply.response_id, 0, reply.response_id)
+                    transcript = ""
+                    options = {"regenerate_response_id": regenerate_response_id}
                 voice = service.response._response_voice_id(request.runtime_config.session.audio.output.voice)
                 selected = request.runtime_config.selected_language
                 if selected not in (None, "auto"):
                     language = selected
-                async with aclosing(self.client.stream(reply.turn, transcript=transcript, language=language, voice=voice)) as stream:
+                async with aclosing(self.client.stream(turn, transcript=transcript, language=language, voice=voice,
+                                                       **options)) as stream:
                     async for event in stream:
-                        if event.type == "text":
+                        if event.type == "ready":
+                            reply.turn = event.turn
+                        elif event.type == "text":
                             queue.put(LLMResponseChunk(text=event.text, language_code=language,
                                                        runtime_config=request.runtime_config, external_delta=True, **tags))
                         else:
                             status = event.type
+                if status == "completed" and regenerate_response_id is not None and reply.turn is not None:
+                    if item_id in self.items and reply.turn.turn_id == f"{request.runtime_config.trace_session_id}:{item_id}":
+                        self.item_replies[item_id] = reply
+                        self.last_turn_id, self.revision = item_id, reply.turn.revision
         except asyncio.CancelledError:
             raise
         except Exception as exc:

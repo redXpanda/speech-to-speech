@@ -44,6 +44,33 @@ class ExternalBridgeTests(IsolatedAsyncioTestCase):
     async def dispatch(self, event):
         await _dispatch_client_event(self.unit, self.conn, event, self.transport)
 
+    async def test_regenerate_restored_reply_without_projecting_an_old_item(self):
+        wire = asyncio.Queue()
+        self.transport.send_context.side_effect = wire.put_nowait
+        self.assertFalse(self.context.items)
+        await self.dispatch({"type": "response.create", "response": {"metadata": {
+            "aivoice_regenerate_response_id": "resp_original",
+        }}})
+        request = await asyncio.wait_for(wire.get(), 1)
+        reply = self.context.active
+        self.assertEqual(request["regenerate_response_id"], "resp_original")
+        self.assertEqual(request["transcript"], "")
+        identity = {"turn_id": "old_session:old_item", "revision": 4, "response_id": reply.response_id}
+        await self.dispatch({"type": "aivoice.context.ready", **identity})
+        await self.dispatch({"type": "aivoice.context.text", "response_id": reply.response_id,
+                             "seq": 0, "text": "new answer"})
+        await self.dispatch({"type": "aivoice.context.terminal", "response_id": reply.response_id, "status": "completed"})
+        await asyncio.wait_for(reply.generation, 1)
+        self.assertEqual(reply.turn, ContextTurn(**identity))
+        self.assertEqual(self.queue.get_nowait().text, "new answer")
+        self.assertFalse(self.context.items)
+        receipt = asyncio.create_task(self.context.receipt(reply, "new answer", 900))
+        frame = await asyncio.wait_for(wire.get(), 1)
+        self.assertEqual({key: frame[key] for key in identity}, identity)
+        await self.dispatch({"type": "aivoice.context.ack", "control_id": frame["control_id"], "ok": True})
+        await asyncio.wait_for(receipt, 1)
+        self.assertTrue(reply.receipt_done.is_set())
+
     async def test_streams_before_model_end_and_waits_for_confirmed_playback(self):
         wire = asyncio.Queue()
         self.transport.send_context.side_effect = wire.put_nowait
