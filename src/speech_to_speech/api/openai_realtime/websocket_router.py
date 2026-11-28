@@ -22,6 +22,7 @@ from openai.types.realtime import (
     SessionUpdateEvent,
 )
 
+from speech_to_speech.api.openai_realtime.context import RealtimeContext
 from speech_to_speech.api.openai_realtime.llm_proxy import LLMProxyConfig, mount_llm_proxy
 from speech_to_speech.api.openai_realtime.pipeline_unit import PipelineUnit, SessionState
 from speech_to_speech.api.openai_realtime.service import (
@@ -370,6 +371,9 @@ def _release_session(unit: PipelineUnit, session_id: str) -> None:
     # prefetch. Invalidate that response while its connection state is still
     # registered, and drop the per-session held item so SESSION_END can drain.
     try:
+        context = unit.service._state(session_id).external_context
+        if context is not None:
+            context.cancel(notify_gateway=False)
         unit.service.close_pending_responses(session_id)
     except KeyError:
         pass
@@ -423,6 +427,64 @@ async def _dispatch_client_event(
                 if getattr(outgoing, "type", None) == "error":
                     outgoing.error.event_id = client_event_id
         await transport.send_events(events)
+
+    st = service._state(session_id)
+    kind = raw.get("type")
+    if isinstance(kind, str) and kind.startswith("aivoice.context."):
+        if transport_kind == "websocket" and st.external_context is not None:
+            st.external_context.client.receive(raw)
+        return
+
+    if kind == "aivoice.item.mutate" or (kind == "conversation.item.delete" and st.external_context is not None):
+        context = st.external_context
+        item_id = raw.get("item_id")
+        op = "delete" if kind == "conversation.item.delete" else raw.get("op")
+        text = raw.get("text")
+
+        async def report(events):
+            if kind == "aivoice.item.mutate" and transport_kind == "websocket":
+                await transport.send_context({"type": "aivoice.item.mutation.done", "event_id": client_event_id,
+                                                   "ok": not any(event.type == "error" for event in events)})
+            else:
+                await send_correlated(events)
+
+        if (transport_kind != "websocket" or context is None or st.in_response or st.response_pending
+                or (context.mutation is not None and not context.mutation.done())
+                or not isinstance(item_id, str) or not 0 < len(item_id) <= 128
+                or op not in ("edit", "delete")
+                or (op == "edit" and (not isinstance(text, str) or not 0 < len(text) <= 4000 or not text.strip()))):
+            await report([service.make_error("Invalid or busy context item mutation.", "invalid_request_error")])
+        else:
+            async def mutate():
+                events = await service.conversation.mutate_external_item(session_id, item_id, op, text)
+                await report(events)
+
+            # Keep reading the WebSocket: the authority ack arrives on this same connection.
+            context.mutation = context.spawn(mutate())
+        return
+
+    if raw.get("type") == "aivoice.playback.receipt":
+        if (transport_kind == "websocket" and st.external_context is not None
+                and set(raw) == {"type", "response_id", "item_id", "played_ms"}
+                and all(isinstance(raw[k], str) and 0 < len(raw[k]) <= 128 for k in ("response_id", "item_id"))
+                and type(raw["played_ms"]) is int and 0 <= raw["played_ms"] <= 2147483647):
+            service.response.external_playback_receipt(session_id, raw["response_id"], raw["item_id"], raw["played_ms"])
+        return
+
+    binding = False
+    if "aivoice_context" in raw:
+        try:
+            value = raw["aivoice_context"]
+            if (transport_kind != "websocket" or raw.get("type") != "session.update"
+                    or st.external_context is not None or st.in_response or st.response_pending
+                    or st.last_item_id is not None or service.context_output_queue is None
+                    or value != {"transport": "websocket"}):
+                raise ValueError
+            binding = True
+            raw = {k: v for k, v in raw.items() if k != "aivoice_context"}
+        except (ValueError, AttributeError, TypeError):
+            await send_correlated([service.make_error("Invalid external context binding.", "invalid_request_error")])
+            return
 
     event = service.parse_client_event(raw)
     if event is None:
@@ -481,11 +543,20 @@ async def _dispatch_client_event(
         service.truncate_unplayed_audio(session_id, transport.discard_pending_audio())
 
     elif isinstance(event, SessionUpdateEvent):
+        if binding or st.external_context is not None:
+            if event.session is None or set(event.session.model_fields_set) - {"type", "audio", "extensions"}:
+                await send_correlated([service.make_error("Unsupported external session settings.", "invalid_request_error")])
+                return
         err = service.handle_session_update(session_id, event)
         if err:
             await send_correlated([err])
         else:
-            await send_correlated([service.build_session_updated(session_id)])
+            updated = service.build_session_updated(session_id)
+            if binding:
+                st.runtime_config.session.instructions = None
+                st.external_context = RealtimeContext(transport.send_context)
+                updated = service.build_session_updated(session_id).model_copy(update={"aivoice_context_ready": True})
+            await send_correlated([updated])
 
     elif isinstance(event, ConversationItemCreateEvent):
         events = service.handle_conversation_item_create(session_id, event)
@@ -523,6 +594,8 @@ async def _dispatch_client_event(
         had_response = st.in_response or st.response_pending
         if had_response:
             unit.cancel_scope.cancel()
+            if st.external_context is not None:
+                st.external_context.cancel()
             _flush_queue(unit.text_prompt_queue, preserve=_keep_pipeline_control)
         _flush_queue(unit.output_queue, preserve=_keep_cancel_bookkeeping)
         _flush_queue(unit.text_output_queue, preserve=_keep_user_text_event)

@@ -103,6 +103,10 @@ class WebSocketTransport(SessionTransport):
         self._sending_seconds = 0.0
         self._discards = 0
 
+    async def send_context(self, event: dict) -> None:
+        async with self._send_lock:
+            await self.websocket.send_json(event)
+
     async def send_events(self, events: list[ServerEvent]) -> None:
         async with self._send_lock:
             for event in events:

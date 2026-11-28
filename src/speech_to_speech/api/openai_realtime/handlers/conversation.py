@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING
 from unicodedata import category
@@ -42,6 +43,8 @@ from openai.types.realtime.realtime_conversation_item_user_message import (
 from openai.types.realtime.realtime_server_event import ConversationItemRetrieved
 from openai.types.responses import ResponseReasoningItem
 
+from speech_to_speech.pipeline.external_context import ContextProtocolError
+
 from speech_to_speech.api.openai_realtime.handlers.base import RealtimeBaseHandler
 from speech_to_speech.api.openai_realtime.input_state import (
     InputItemState,
@@ -60,7 +63,7 @@ from speech_to_speech.pipeline.events import (
     TranscriptionFailedEvent,
 )
 from speech_to_speech.pipeline.transcript_logging import transcript_for_log
-from speech_to_speech.utils.utils import is_out_of_band, response_wants_audio
+from speech_to_speech.utils.utils import _generate_id, is_out_of_band, response_wants_audio
 
 if TYPE_CHECKING:
     from speech_to_speech.api.openai_realtime.service import ServerEvent
@@ -155,6 +158,18 @@ class ConversationHandler(RealtimeBaseHandler):
         behind the response's still-buffered output.
         """
         st = self._state(conn_id)
+        if st.external_context is not None:
+            item = event.item
+            if (not isinstance(item, RealtimeConversationItemUserMessage) or not item.content
+                    or any(part.type != "input_text" or not part.text for part in item.content)):
+                return [self.make_error("External context accepts only user text items.", "invalid_conversation_item")]
+            item = item.model_copy(update={"id": item.id or _generate_id("item"), "status": "completed", "object": "realtime.item"})
+            st.external_context.remember(item)
+            st.external_context.input = (item.id, " ".join(part.text for part in item.content), None)
+            previous = st.last_item_id
+            st.last_item_id = item.id
+            return [ConversationItemCreatedEvent(type="conversation.item.created", event_id=self._next_event_id(),
+                                                 previous_item_id=previous, item=item)]
         if st.in_response or st.response_pending:
             if isinstance(event.item, RealtimeConversationItemFunctionCallOutput):
                 st.deferred_function_output_previous_item_ids[event.item.call_id] = event.previous_item_id
@@ -179,6 +194,60 @@ class ConversationHandler(RealtimeBaseHandler):
             st.deferred_items.append(event)
             return []
         return self._apply_delete(conn_id, event)
+
+    async def mutate_external_item(self, conn_id: str, item_id: str, op: str, text: str | None) -> list[ServerEvent]:
+        st = self._state(conn_id)
+        context = st.external_context
+        item = context.items.get(item_id)
+        if not isinstance(item, (RealtimeConversationItemUserMessage, RealtimeConversationItemAssistantMessage)):
+            return [self.make_error("Unknown conversation item.", "invalid_conversation_item")]
+        role = item.role
+        reply = context.item_replies.get(item_id)
+        ids = [item_id]
+        if role == "assistant" and reply is not None:
+            ids = [key for key, projection in context.items.items()
+                   if isinstance(projection, RealtimeConversationItemAssistantMessage)
+                   and context.item_replies.get(key) is reply]
+        if reply is not None and reply.turn is not None:
+            try:
+                if reply.receipt_task is not None:
+                    await asyncio.shield(reply.receipt_task)
+                await asyncio.wait_for(context.client.mutate(reply.turn, role=role, op=op, text=text), timeout=5)
+            except (ContextProtocolError, TimeoutError, OSError) as exc:
+                logger.warning("Context item mutation failed (%s)", type(exc).__name__)
+                return [self.make_error("Context item mutation failed.", "invalid_conversation_item")]
+            if role == "assistant" or op == "delete":
+                reply.receipt_sent = True
+                reply.receipt_done.set()
+
+        if role == "user" and context.input and context.input[0] == item_id:
+            context.input = (item_id, text, context.input[2]) if op == "edit" else None
+        events = []
+        for key in ids:
+            if role == "assistant":
+                st.assistant_audio_segments.pop(key, None)
+                st.assistant_audio_cuts.pop(key, None)
+            if op == "delete":
+                context.items.pop(key)
+                context.item_replies.pop(key, None)
+                st.published_input_transcripts.pop(key, None)
+                st.pending_input_terminals.pop(key, None)
+                self._service.audio._release_input_item_state_by_id(conn_id, key)
+                if key in st.acknowledged_item_ids:
+                    st.acknowledged_item_ids.remove(key)
+                if st.last_item_id == key:
+                    st.last_item_id = next(reversed(context.items), None)
+                events.append(ConversationItemDeletedEvent(type="conversation.item.deleted", event_id=self._next_event_id(), item_id=key))
+            elif role == "assistant":
+                context.items[key].content = [AssistantContent(type="output_text", text=text)] if key == item_id else []
+            else:
+                if item_id in st.published_input_transcripts:
+                    st.published_input_transcripts[item_id] = text
+                if any(part.type == "input_audio" for part in item.content):
+                    item.content = [UserContent(type="input_audio", transcript=text)]
+                else:
+                    item.content = [UserContent(type="input_text", text=text)]
+        return events
 
     def _apply_delete(self, conn_id: str, event: ConversationItemDeleteEvent) -> list[ServerEvent]:
         st = self._state(conn_id)
@@ -217,7 +286,10 @@ class ConversationHandler(RealtimeBaseHandler):
         st.assistant_audio_segments.pop(event.item_id, None)
         st.assistant_audio_cuts.pop(event.item_id, None)
         self._service.audio._release_input_item_state_by_id(conn_id, event.item_id)
-        retained_ids = chat.item_ids() | chat.unheard_assistant_item_ids() | st.input_items.keys()
+        if st.external_context is not None:
+            retained_ids = st.external_context.items.keys() | st.published_input_transcripts.keys() | st.input_items.keys()
+        else:
+            retained_ids = chat.item_ids() | chat.unheard_assistant_item_ids() | st.input_items.keys()
         st.acknowledged_item_ids = [item_id for item_id in st.acknowledged_item_ids if item_id in retained_ids]
         if removed is not None and removed.type == "function_call" and removed.call_id is not None:
             st.input_turn_by_call_id.pop(removed.call_id, None)
@@ -259,6 +331,17 @@ class ConversationHandler(RealtimeBaseHandler):
         """Return the wire form of an item the client has seen and the server still holds."""
         st = self._state(conn_id)
         published = st.published_input_transcripts
+        if st.external_context is not None:
+            if item_id in st.external_context.items:
+                return st.external_context.items[item_id]
+            if item_id in published or (item_id in st.input_items and item_id in st.acknowledged_item_ids):
+                return self._user_audio_item(item_id, published.get(item_id))
+            for pending in st.pending_text_outputs:
+                if pending["item_id"] == item_id and item_id in st.acknowledged_item_ids:
+                    item = self._service.response._build_message_item(pending, True, "completed")
+                    item.status = pending.get("status", "in_progress")
+                    return item
+            return None
         if item_id not in st.acknowledged_item_ids and item_id not in published:
             return None
 
@@ -385,7 +468,10 @@ class ConversationHandler(RealtimeBaseHandler):
         """Track retained wire chronology so deleting the tail restores its predecessor."""
         st = self._state(conn_id)
         chat = st.runtime_config.chat
-        retained_ids = chat.item_ids() | chat.unheard_assistant_item_ids() | st.input_items.keys()
+        if st.external_context is not None:
+            retained_ids = st.external_context.items.keys() | st.published_input_transcripts.keys() | st.input_items.keys()
+        else:
+            retained_ids = chat.item_ids() | chat.unheard_assistant_item_ids() | st.input_items.keys()
         retained_ids.update(str(item["item_id"]) for item in st.pending_text_outputs)
         retained_ids.update(call.id for call in st.pending_function_calls.values() if call.id is not None)
         st.acknowledged_item_ids = [

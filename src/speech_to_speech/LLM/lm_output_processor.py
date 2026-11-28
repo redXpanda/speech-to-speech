@@ -9,10 +9,12 @@ Intercepts LLM output to:
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterator
 from queue import Queue
 from uuid import uuid4
 
+from speech_to_speech.LLM.utils import remove_markdown, remove_unspeechable, sent_tokenize_preserving_markdown_code
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline import language_detection
@@ -132,6 +134,43 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
             return True
         return self.speculative_turns.wait_for_gate(turn_id, turn_revision)
 
+    _external_tail: LLMResponseChunk | None = None
+
+    def _external_speech(self, output: LLMResponseChunk | EndOfResponse) -> Iterator[TTSIn | PipelineEvent]:
+        if self._response_key is not None and self._response_key != output.response_key:
+            self._reset_response()
+        tail = self._external_tail
+        if tail is not None and tail.response_key != output.response_key:
+            tail = self._external_tail = None
+        if isinstance(output, LLMResponseChunk):
+            text = (tail.text if tail is not None else "") + output.text
+            # Keep the raw tail so a trailing space in one model delta is not
+            # lost when the next delta starts a word. A marker lets a terminal
+            # CJK punctuation or period followed by whitespace flush promptly.
+            marker = "\x00aivoice-tail\x00"
+            sentences = sent_tokenize_preserving_markdown_code(
+                text + marker, lambda prose: re.split(r"(?<=[.!?])\s+", prose)
+            )
+            last = sentences[-1].removesuffix(marker)
+            raw_start = text.rfind(last) if last else len(text)
+            ready = sentences[:-1] if raw_start >= 0 else []
+            self._external_tail = output.model_copy(update={"text": text[raw_start:] if ready else text})
+            template = output
+        else:
+            self._external_tail = None
+            template = tail
+            ready = [tail.text] if tail is not None and not (output.error or output.cleanup_only) else []
+        for sentence in ready:
+            text = remove_markdown(remove_unspeechable(sentence)).strip()
+            if text:
+                yield from self.process(LLMResponseChunk(
+                    text=text, runtime_config=template.runtime_config, language_code=template.language_code,
+                    turn_id=template.turn_id, turn_revision=template.turn_revision,
+                    response_key=template.response_key, cancel_generation=template.cancel_generation,
+                ))
+        if isinstance(output, EndOfResponse):
+            yield from self.process(output.model_copy(update={"external_delta": False}))
+
     def process(self, lm_output: LLMOut) -> Iterator[TTSIn | PipelineEvent]:
         """
         Forward response events and audio inputs in their original order.
@@ -139,6 +178,15 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
         Yields:
             Response events, :class:`TTSInput`, or :class:`EndOfResponse`
         """
+        if isinstance(lm_output, (LLMResponseChunk, EndOfResponse)) and lm_output.external_delta:
+            yield from self._external_speech(lm_output)
+            return
+
+        if isinstance(lm_output, EndOfResponse) and lm_output.cleanup_only:
+            self._reset_response()
+            yield lm_output
+            return
+
         if isinstance(lm_output, TokenUsage):
             usage_response_key = self._start_response(lm_output.response_key)
             usage_event = TokenUsageEvent(
@@ -324,4 +372,5 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
             yield tts_input
 
     def on_session_end(self) -> None:
+        self._external_tail = None
         self._reset_response()

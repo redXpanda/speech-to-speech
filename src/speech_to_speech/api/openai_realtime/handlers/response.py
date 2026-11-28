@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -149,7 +150,8 @@ class ResponseHandler(RealtimeBaseHandler):
         ):
             raise RuntimeError("Cannot attach output to a different active response")
         if st.current_response_id is None:
-            st.current_response_id = _generate_id("resp")
+            reply = st.external_context.replies.get(response_key) if st.external_context is not None else None
+            st.current_response_id = reply.response_id if reply is not None else _generate_id("resp")
             st.current_response_key = response_key
             self._start_item(conn_id)
             st.in_response = True
@@ -868,6 +870,17 @@ class ResponseHandler(RealtimeBaseHandler):
         on failure, or ``None`` if there is no text_prompt_queue.
         """
         st = self._state(conn_id)
+        if st.external_context is not None:
+            if event.response is not None and event.response.model_dump(exclude_unset=True):
+                return self.make_error("Response overrides are unsupported with external context.", "invalid_request_error")
+            if st.in_response or st.response_pending:
+                return self.make_error("Another response is active.", "conversation_already_has_active_response")
+            request = GenerateResponseRequest(runtime_config=st.runtime_config)
+            st.external_context.start(self._service, request)
+            self._ensure_response(conn_id, request.response_key)
+            st.response_created_pending_key = request.response_key
+            return ResponseCreatedEvent(type="response.created", event_id=self._next_event_id(),
+                                        response=self._build_response(conn_id, "in_progress"))
         if event.response:
             if event.response.tool_choice and not isinstance(event.response.tool_choice, str):
                 return self.make_error(
@@ -1045,6 +1058,11 @@ class ResponseHandler(RealtimeBaseHandler):
             segments.append(["", 0, 0])
         segments[-1][1] += samples
         segments[-1][2] += samples
+        st = self._state(conn_id)
+        if st.external_context is not None:
+            reply = st.external_context.replies.get(st.current_response_key)
+            if reply is not None:
+                reply.item_id = item_id
 
     def _samples_per_char(self, conn_id: str, unfinished: list[Any]) -> float:
         """Measure this session's speaking rate from completely synthesized segments."""
@@ -1145,14 +1163,62 @@ class ResponseHandler(RealtimeBaseHandler):
         _log_heard(item_id, segments, text, source)
 
     def handle_conversation_item_truncate(self, conn_id: str, event: ConversationItemTruncateEvent) -> None:
-        """Remove the unplayed part of an assistant reply from model history."""
+        """Cut the wire projection, or legacy model history on an unbound session."""
+        st = self._state(conn_id)
         played_samples = event.audio_end_ms * PIPELINE_OUTPUT_RATE // 1000
+        if st.external_context is not None:
+            reply = next((r for r in st.external_context.replies.values() if r.item_id == event.item_id), None)
+            if reply is not None and reply.status is not None and not reply.receipt_sent:
+                self._external_played_prefix(conn_id, event.item_id, event.audio_end_ms, reply.status)
+            return
         self._truncate_audio_item(conn_id, event.item_id, played_samples, "client playback position")
+
+    def _external_played_prefix(self, conn_id: str, item_id: str, played_ms: int, status: str) -> tuple[str, int]:
+        st = self._state(conn_id)
+        segments = st.assistant_audio_segments.get(item_id, [])
+        played_ms = min(played_ms, (sum(segment[1] for segment in segments) * 1000 + PIPELINE_OUTPUT_RATE - 1)
+                        // PIPELINE_OUTPUT_RATE)
+        remaining = played_samples = played_ms * PIPELINE_OUTPUT_RATE // 1000
+        complete = []
+        # On interruption the last emitted segment may still be synthesizing.
+        for segment in segments if status == "completed" else segments[:-1]:
+            if not segment[1] or remaining < segment[1]:
+                break
+            complete.append(segment)
+            remaining -= segment[1]
+        text = _heard_transcript(complete, sum(segment[1] for segment in complete))[:16000]
+        st.assistant_audio_cuts[item_id] = played_samples
+        assert st.external_context is not None
+        item = st.external_context.items.get(item_id)
+        if isinstance(item, RealtimeConversationItemAssistantMessage):
+            item.content = [Content(type="output_audio", transcript=text)]
+        return text, played_ms
+
+    def external_playback_receipt(self, conn_id: str, response_id: str, item_id: str, played_ms: int) -> None:
+        context = self._state(conn_id).external_context
+        if context is None:
+            return
+        if context.mutation is not None and not context.mutation.done():
+            async def after_mutation(mutation):
+                await asyncio.shield(mutation)
+                self.external_playback_receipt(conn_id, response_id, item_id, played_ms)
+
+            context.spawn(after_mutation(context.mutation))
+            return
+        reply = next((r for r in context.replies.values() if r.response_id == response_id), None)
+        if (reply is None or reply.item_id != item_id or reply.turn is None
+                or reply.status is None or reply.receipt_sent):
+            return
+        text, played_ms = self._external_played_prefix(conn_id, item_id, played_ms, reply.status)
+        reply.receipt_sent = True
+        reply.receipt_task = context.spawn(context.receipt(reply, text, played_ms))
 
     def truncate_unplayed_audio(self, conn_id: str, unplayed_ms: float) -> None:
         """Remove audio the client did not play from the newest items."""
         remaining = round(unplayed_ms * PIPELINE_OUTPUT_RATE / 1000)
         st = self._state(conn_id)
+        if st.external_context is not None:
+            return
         for item_id, segments in reversed(list(st.assistant_audio_segments.items())):
             if remaining <= 0:
                 break
@@ -1281,7 +1347,7 @@ class ResponseHandler(RealtimeBaseHandler):
                     response=terminal_response,
                 )
             )
-            if not is_out_of_band(st.current_response_params):
+            if st.external_context is None and not is_out_of_band(st.current_response_params):
                 self._record_audio_output_items(conn_id, terminal_response.output or [])
             tool_inputs = st.response_tool_inputs.pop(st.current_response_key or "", set())
             if status == "completed" and terminal_response.output and not is_out_of_band(st.current_response_params):
@@ -1290,6 +1356,14 @@ class ResponseHandler(RealtimeBaseHandler):
                     st.answered_tool_call_ids[call_id] = None
                 while len(st.answered_tool_call_ids) > TOOL_FOLLOWUP_ACK_LIMIT:
                     st.answered_tool_call_ids.pop(next(iter(st.answered_tool_call_ids)))
+            if st.external_context is not None:
+                reply = st.external_context.replies.get(st.current_response_key)
+                if reply is not None:
+                    reply.status = status
+                for item in terminal_response.output or []:
+                    st.external_context.remember(item.model_copy(deep=True), reply)
+                self._end_response(conn_id, status)
+                return events
             if status == "completed":
                 st.runtime_config.chat.bind_assistant_item_ids(
                     st.current_response_key,
@@ -1338,8 +1412,9 @@ class ResponseHandler(RealtimeBaseHandler):
             if decision.action is TurnGateAction.DROP:
                 logger.debug("Dropping stale assistant output for turn=%s rev=%s", event.turn_id, event.turn_revision)
                 return False
-        self._service.history.accept(conn_id, event.response_key)
         st = self._state(conn_id)
+        if st.external_context is None:
+            self._service.history.accept(conn_id, event.response_key)
         if st.current_response_turn_id is None and event.turn_id is not None:
             st.current_response_turn_id = event.turn_id
             st.current_response_turn_revision = event.turn_revision

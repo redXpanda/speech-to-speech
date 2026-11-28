@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from collections.abc import Mapping
 from queue import Queue
@@ -91,6 +92,7 @@ from speech_to_speech.pipeline.events import (
     TranscriptionFailedEvent,
 )
 from speech_to_speech.pipeline.messages import GenerateResponseRequest
+from speech_to_speech.api.openai_realtime.context import RealtimeContext
 from speech_to_speech.pipeline.queue_types import TextPromptItem
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker, TurnGateAction, TurnPhase
 from speech_to_speech.pipeline.transcript_logging import log_exception, transcript_for_log
@@ -345,6 +347,7 @@ class ConnState(BaseModel):
     pending_item_acks: list[ConversationItem] = Field(default_factory=list)
     generation_done_tool_calls: dict[str, set[str]] = Field(default_factory=dict)
     completed_tool_response_keys: dict[str, None] = Field(default_factory=dict)
+    external_context: RealtimeContext | None = None
     tool_followup_prefetch_request: GenerateResponseRequest | None = None
     tool_followup_prefetch_origin_response_key: str | None = None
     # A client-triggered response is not visible until its response.created
@@ -397,6 +400,8 @@ class RealtimeService:
         default_instructions: str | None = None,
     ) -> None:
         self.text_prompt_queue = text_prompt_queue
+        self.context_output_queue = None
+        self.context_cancel_scope = None
         self.should_listen = should_listen
         self._chat_size = chat_size
         self.speculative_turns = speculative_turns
@@ -499,6 +504,8 @@ class RealtimeService:
             # Suppress any in-flight compaction splice so a daemon worker can't
             # mutate a Chat tied to a closed session, and don't make further
             # billable LLM calls on its behalf once the splice is suppressed.
+            if st.external_context is not None:
+                asyncio.create_task(st.external_context.close())
             st.runtime_config.chat.close()
             for input_tokens, output_tokens in st.pending_token_usage.values():
                 st.response_usage.input_tokens += input_tokens
@@ -913,6 +920,30 @@ class RealtimeService:
         transcript = event.transcript
         if event.speaker_attribution is not None:
             transcript = event.speaker_attribution.for_llm(transcript)
+        if st.external_context is not None:
+            item_id = completed_events[0].item_id
+            st.external_context.remember(self.conversation._user_audio_item(item_id, event.transcript))
+            st.external_context.input = (item_id, transcript, event.language_code) if transcript else None
+            if transcript and cfg.create_response_enabled:
+                request = GenerateResponseRequest(
+                    runtime_config=cfg, language_code=event.language_code,
+                    turn_id=event.turn_id, turn_revision=event.turn_revision,
+                    speech_stopped_at_s=event.speech_stopped_at_s,
+                )
+                self.bind_response_latency_tracker(conn_id, request.response_key,
+                                                   turn_id=event.turn_id, turn_revision=event.turn_revision)
+                st.mark_response_pending(request.response_key)
+                st.external_context.start(self, request)
+            self.audio.hold_input_terminal(conn_id, item_id, event.turn_id, event.turn_revision,
+                                           terminal=completed_events[0])
+            terminals = self.audio.resolve_input_terminals(conn_id)
+            if cfg.input_audio_transcription_snapshots_enabled and item_id in st.pending_input_terminals:
+                final = completed_events[0]
+                terminals.append(SpeechToSpeechInputAudioTranscriptionSnapshotEvent(
+                    event_id=self._next_event_id(), item_id=final.item_id,
+                    transcript=final.transcript, asr_complete=True,
+                ))
+            return terminals
         user_item_id = accounting.user_item_id if accounting is not None else None
         user_message = make_user_message(transcript)
         if protocol_item_id is not None:
@@ -1005,6 +1036,8 @@ class RealtimeService:
     def _on_audio_input_completed(self, conn_id: str, event: AudioInputCompletedEvent) -> list[ServerEvent]:
         """Record final input audio and queue its realtime LM request."""
         st = self._state(conn_id)
+        if st.external_context is not None:
+            return [self.make_error("External context requires a transcript.", "invalid_request_error")]
         protocol_item_id = self.audio._input_item_id(conn_id, event.turn_id, event.turn_revision)
         self.audio.release_input_item_state(conn_id, event.turn_id, event.turn_revision)
         self.response.discard_tool_followup_prefetch(conn_id)

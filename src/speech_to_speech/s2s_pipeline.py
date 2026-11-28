@@ -650,6 +650,10 @@ def _build_pipeline_unit(
         default_instructions=default_instructions,
     )
 
+    if stt_selection.name != "none":
+        service.context_output_queue = lm_response_queue
+        service.context_cancel_scope = cancel_scope
+
     if module_kwargs.enable_live_transcription and not stt_selection.spec.capabilities.streams_audio_chunks:
         vad_kw.enable_realtime_transcription = True
         vad_kw.realtime_processing_pause = module_kwargs.live_transcription_update_interval

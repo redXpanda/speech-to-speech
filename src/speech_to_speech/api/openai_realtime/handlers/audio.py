@@ -380,6 +380,8 @@ class AudioHandler(RealtimeBaseHandler):
         # its user item becomes permanent before the new turn opens.
         events: list[ServerEvent] = self.resolve_input_terminals(conn_id, started_turn_id=event.turn_id)
         interrupt_enabled = event.interrupt_response and st.runtime_config.interrupt_response_enabled
+        if interrupt_enabled and st.external_context is not None:
+            st.external_context.cancel()
         if st.in_response and interrupt_enabled:
             events.extend(response.finish_response(conn_id, status="cancelled", reason="turn_detected"))
         if interrupt_enabled:

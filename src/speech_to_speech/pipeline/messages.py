@@ -162,6 +162,7 @@ class LLMResponseChunk(PipelineMessage):
     history: ResponseHistory | None = Field(default=None, exclude=True, repr=False)
 
     tag: Literal["llm_response_chunk"] = "llm_response_chunk"
+    external_delta: bool = Field(default=False, exclude=True)
     parts: list[AssistantOutputPart] = Field(default_factory=list)
     text: str = ""
     language_code: Optional[str] = None
@@ -214,6 +215,7 @@ class EndOfResponse(PipelineMessage):
     reasoning: list[AssistantReasoningPart] = Field(default_factory=list)
 
     tag: Literal["end_of_response"] = "end_of_response"
+    external_delta: bool = Field(default=False, exclude=True)
     turn_id: str | None = None
     turn_revision: int | None = None
     cancel_generation: int | None = None
